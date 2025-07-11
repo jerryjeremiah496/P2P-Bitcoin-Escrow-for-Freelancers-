@@ -4,6 +4,9 @@
 (define-constant ERR-ALREADY-APPROVED (err u103))
 (define-constant ERR-NOT-COMPLETED (err u104))
 (define-constant ERR-ALREADY-EXISTS (err u105))
+(define-constant ERR-DISPUTE-ALREADY-RAISED (err u106))
+(define-constant ERR-NO-DISPUTE (err u107))
+(define-constant ERR-DISPUTE-RESOLVED (err u108))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -17,6 +20,9 @@
         freelancer-approved: bool,
         is-active: bool,
         completed: bool,
+        dispute-raised: bool,
+        dispute-resolved: bool,
+        arbitrator: (optional principal),
     }
 )
 
@@ -45,6 +51,9 @@
             freelancer-approved: false,
             is-active: true,
             completed: false,
+            dispute-raised: false,
+            dispute-resolved: false,
+            arbitrator: none,
         })
         (var-set escrow-counter escrow-id)
         (ok escrow-id)
@@ -90,5 +99,57 @@
             })
         )
         (ok true)
+    )
+)
+
+(define-public (raise-dispute (escrow-id uint) (arbitrator principal))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (not (get dispute-raised escrow)) ERR-DISPUTE-ALREADY-RAISED)
+        (asserts! 
+            (or (is-eq (get client escrow) tx-sender) (is-eq (get freelancer escrow) tx-sender))
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set escrows { escrow-id: escrow-id }
+            (merge escrow { 
+                dispute-raised: true,
+                arbitrator: (some arbitrator),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (escrow-id uint) (award-to-client bool))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (get dispute-raised escrow) ERR-NO-DISPUTE)
+        (asserts! (not (get dispute-resolved escrow)) ERR-DISPUTE-RESOLVED)
+        (asserts! 
+            (is-eq (unwrap! (get arbitrator escrow) ERR-NO-DISPUTE) tx-sender)
+            ERR-NOT-AUTHORIZED
+        )
+        (if award-to-client
+            (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get client escrow))))
+            (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get freelancer escrow))))
+        )
+        (map-set escrows { escrow-id: escrow-id }
+            (merge escrow {
+                is-active: false,
+                completed: true,
+                dispute-resolved: true,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute-status (escrow-id uint))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (ok {
+            dispute-raised: (get dispute-raised escrow),
+            dispute-resolved: (get dispute-resolved escrow),
+            arbitrator: (get arbitrator escrow),
+        })
     )
 )
