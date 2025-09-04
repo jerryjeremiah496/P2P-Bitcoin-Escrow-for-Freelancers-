@@ -11,6 +11,9 @@
 (define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u110))
 (define-constant ERR-INVALID-MILESTONE-PERCENTAGE (err u111))
 (define-constant ERR-MILESTONES-EXCEED-100-PERCENT (err u112))
+(define-constant ERR-DEADLINE-PASSED (err u113))
+(define-constant ERR-INVALID-DEADLINE (err u114))
+(define-constant ERR-DEADLINE-NOT-PASSED (err u115))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -31,6 +34,8 @@
         total-milestones: uint,
         completed-milestones: uint,
         released-amount: uint,
+        deadline: uint,
+        created-at: uint,
     }
 )
 
@@ -70,9 +75,15 @@
 (define-public (create-escrow
         (freelancer principal)
         (amount uint)
+        (deadline-blocks uint)
     )
-    (let ((escrow-id (+ (var-get escrow-counter) u1)))
+    (let (
+            (escrow-id (+ (var-get escrow-counter) u1))
+            (current-block stacks-block-height)
+            (deadline (+ current-block deadline-blocks))
+        )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> deadline-blocks u0) ERR-INVALID-DEADLINE)
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (map-set escrows { escrow-id: escrow-id } {
             client: tx-sender,
@@ -89,6 +100,8 @@
             total-milestones: u0,
             completed-milestones: u0,
             released-amount: u0,
+            deadline: deadline,
+            created-at: current-block,
         })
         (var-set escrow-counter escrow-id)
         (ok escrow-id)
@@ -99,6 +112,9 @@
     (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
         (asserts! (is-eq (get client escrow) tx-sender) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (< stacks-block-height (get deadline escrow))
+            ERR-DEADLINE-PASSED
+        )
         (asserts! (not (get client-approved escrow)) ERR-ALREADY-APPROVED)
         (map-set escrows { escrow-id: escrow-id }
             (merge escrow { client-approved: true })
@@ -111,6 +127,9 @@
     (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
         (asserts! (is-eq (get freelancer escrow) tx-sender) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (< stacks-block-height (get deadline escrow))
+            ERR-DEADLINE-PASSED
+        )
         (asserts! (not (get freelancer-approved escrow)) ERR-ALREADY-APPROVED)
         (map-set escrows { escrow-id: escrow-id }
             (merge escrow { freelancer-approved: true })
@@ -303,5 +322,69 @@
             released-amount: (get released-amount escrow),
             remaining-amount: (- (get amount escrow) (get released-amount escrow)),
         })
+    )
+)
+
+(define-read-only (get-deadline-info (escrow-id uint))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (ok {
+            deadline: (get deadline escrow),
+            created-at: (get created-at escrow),
+            blocks-remaining: (if (> (get deadline escrow) stacks-block-height)
+                (- (get deadline escrow) stacks-block-height)
+                u0
+            ),
+            is-expired: (>= stacks-block-height (get deadline escrow)),
+        })
+    )
+)
+
+(define-read-only (is-escrow-expired (escrow-id uint))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (ok (>= stacks-block-height (get deadline escrow)))
+    )
+)
+
+(define-public (claim-timeout-refund (escrow-id uint))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (is-eq (get client escrow) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (>= stacks-block-height (get deadline escrow))
+            ERR-DEADLINE-NOT-PASSED
+        )
+        (asserts!
+            (not (and (get client-approved escrow) (get freelancer-approved escrow)))
+            ERR-NOT-COMPLETED
+        )
+        (let ((refund-amount (- (get amount escrow) (get released-amount escrow))))
+            (try! (as-contract (stx-transfer? refund-amount tx-sender (get client escrow))))
+            (map-set escrows { escrow-id: escrow-id }
+                (merge escrow {
+                    is-active: false,
+                    completed: true,
+                })
+            )
+            (ok refund-amount)
+        )
+    )
+)
+
+(define-public (extend-deadline
+        (escrow-id uint)
+        (additional-blocks uint)
+    )
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (> additional-blocks u0) ERR-INVALID-DEADLINE)
+        (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts!
+            (or (is-eq (get client escrow) tx-sender) (is-eq (get freelancer escrow) tx-sender))
+            ERR-NOT-AUTHORIZED
+        )
+        (let ((new-deadline (+ (get deadline escrow) additional-blocks)))
+            (map-set escrows { escrow-id: escrow-id }
+                (merge escrow { deadline: new-deadline })
+            )
+            (ok new-deadline)
+        )
     )
 )
