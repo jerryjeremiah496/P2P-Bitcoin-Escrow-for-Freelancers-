@@ -14,6 +14,10 @@
 (define-constant ERR-DEADLINE-PASSED (err u113))
 (define-constant ERR-INVALID-DEADLINE (err u114))
 (define-constant ERR-DEADLINE-NOT-PASSED (err u115))
+(define-constant ERR-INVALID-RATING (err u116))
+(define-constant ERR-RATING-ALREADY-EXISTS (err u117))
+(define-constant ERR-CANNOT-RATE-SELF (err u118))
+(define-constant ERR-INSUFFICIENT-INTERACTIONS (err u119))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -40,6 +44,34 @@
 )
 
 (define-data-var escrow-counter uint u0)
+
+;; Reputation System Data Structures
+(define-map user-reputation
+    { user: principal }
+    {
+        total-escrows-as-client: uint,
+        total-escrows-as-freelancer: uint,
+        completed-escrows-as-client: uint,
+        completed-escrows-as-freelancer: uint,
+        total-rating-points: uint,
+        total-ratings-received: uint,
+        reputation-score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map user-ratings
+    {
+        rater: principal,
+        rated: principal,
+        escrow-id: uint,
+    }
+    {
+        rating: uint,
+        comment: (string-ascii 500),
+        timestamp: uint,
+    }
+)
 
 (define-map milestones
     {
@@ -70,6 +102,68 @@
         escrow-id: escrow-id,
         milestone-id: milestone-id,
     })
+)
+
+;; Reputation System Read-Only Functions
+(define-read-only (get-user-reputation (user principal))
+    (default-to {
+        total-escrows-as-client: u0,
+        total-escrows-as-freelancer: u0,
+        completed-escrows-as-client: u0,
+        completed-escrows-as-freelancer: u0,
+        total-rating-points: u0,
+        total-ratings-received: u0,
+        reputation-score: u0,
+        last-updated: u0,
+    }
+    (map-get? user-reputation { user: user })
+    )
+)
+
+(define-read-only (get-user-rating
+        (rater principal)
+        (rated principal)
+        (escrow-id uint)
+    )
+    (map-get? user-ratings {
+        rater: rater,
+        rated: rated,
+        escrow-id: escrow-id,
+    })
+)
+
+(define-read-only (calculate-reputation-score
+        (total-rating-points uint)
+        (total-ratings-received uint)
+        (completion-rate uint)
+    )
+    (if (is-eq total-ratings-received u0)
+        u0
+        (let (
+                (average-rating (/ total-rating-points total-ratings-received))
+                (weighted-score (+ (* average-rating u70) (* completion-rate u30)))
+            )
+            (/ weighted-score u100)
+        )
+    )
+)
+
+(define-read-only (get-user-completion-rate (user principal))
+    (let ((reputation (get-user-reputation user)))
+        (let (
+                (total-as-client (get total-escrows-as-client reputation))
+                (total-as-freelancer (get total-escrows-as-freelancer reputation))
+                (completed-as-client (get completed-escrows-as-client reputation))
+                (completed-as-freelancer (get completed-escrows-as-freelancer reputation))
+                (total-escrows (+ total-as-client total-as-freelancer))
+                (total-completed (+ completed-as-client completed-as-freelancer))
+            )
+            (if (is-eq total-escrows u0)
+                u0
+                (/ (* total-completed u100) total-escrows)
+            )
+        )
+    )
 )
 
 (define-public (create-escrow
@@ -104,7 +198,12 @@
             created-at: current-block,
         })
         (var-set escrow-counter escrow-id)
-        (ok escrow-id)
+        (begin
+            ;; Update reputation counters for both client and freelancer
+            (increment-escrow-counter tx-sender true false)
+            (increment-escrow-counter freelancer false false)
+            (ok escrow-id)
+        )
     )
 )
 
@@ -152,7 +251,12 @@
                 completed: true,
             })
         )
-        (ok true)
+        (begin
+            ;; Update completion statistics for both parties
+            (increment-escrow-counter (get client escrow) true true)
+            (increment-escrow-counter (get freelancer escrow) false true)
+            (ok true)
+        )
     )
 )
 
@@ -200,7 +304,12 @@
                 dispute-resolved: true,
             })
         )
-        (ok true)
+        (begin
+            ;; Update completion statistics - mark as completed for dispute resolution
+            (increment-escrow-counter (get client escrow) true true)
+            (increment-escrow-counter (get freelancer escrow) false true)
+            (ok true)
+        )
     )
 )
 
@@ -364,7 +473,12 @@
                     completed: true,
                 })
             )
-            (ok refund-amount)
+            (begin
+                ;; Update completion statistics - timeout doesn't count as successful completion
+                ;; Only client gets completion credit for claiming refund
+                (increment-escrow-counter (get client escrow) true true)
+                (ok refund-amount)
+            )
         )
     )
 )
@@ -385,6 +499,92 @@
                 (merge escrow { deadline: new-deadline })
             )
             (ok new-deadline)
+        )
+    )
+)
+
+;; Reputation System Public Functions
+(define-public (rate-user
+        (escrow-id uint)
+        (rated-user principal)
+        (rating uint)
+        (comment (string-ascii 500))
+    )
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (get completed escrow) ERR-NOT-COMPLETED)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (not (is-eq tx-sender rated-user)) ERR-CANNOT-RATE-SELF)
+        (asserts!
+            (or (is-eq (get client escrow) tx-sender) (is-eq (get freelancer escrow) tx-sender))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts!
+            (or (is-eq (get client escrow) rated-user) (is-eq (get freelancer escrow) rated-user))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts!
+            (is-none (get-user-rating tx-sender rated-user escrow-id))
+            ERR-RATING-ALREADY-EXISTS
+        )
+        ;; Store the rating
+        (map-set user-ratings {
+            rater: tx-sender,
+            rated: rated-user,
+            escrow-id: escrow-id,
+        } {
+            rating: rating,
+            comment: comment,
+            timestamp: stacks-block-height,
+        })
+        ;; Update rated user's reputation
+        (update-user-reputation rated-user rating)
+        (ok true)
+    )
+)
+
+(define-private (update-user-reputation (user principal) (new-rating uint))
+    (let ((current-rep (get-user-reputation user)))
+        (let (
+                (new-total-points (+ (get total-rating-points current-rep) new-rating))
+                (new-total-ratings (+ (get total-ratings-received current-rep) u1))
+                (completion-rate (get-user-completion-rate user))
+                (new-score (calculate-reputation-score new-total-points new-total-ratings completion-rate))
+            )
+            (map-set user-reputation { user: user }
+                (merge current-rep {
+                    total-rating-points: new-total-points,
+                    total-ratings-received: new-total-ratings,
+                    reputation-score: new-score,
+                    last-updated: stacks-block-height,
+                })
+            )
+        )
+    )
+)
+
+(define-private (increment-escrow-counter (user principal) (as-client bool) (completed bool))
+    (let ((current-rep (get-user-reputation user)))
+        (if as-client
+            (map-set user-reputation { user: user }
+                (merge current-rep {
+                    total-escrows-as-client: (+ (get total-escrows-as-client current-rep) u1),
+                    completed-escrows-as-client: (if completed
+                        (+ (get completed-escrows-as-client current-rep) u1)
+                        (get completed-escrows-as-client current-rep)
+                    ),
+                    last-updated: stacks-block-height,
+                })
+            )
+            (map-set user-reputation { user: user }
+                (merge current-rep {
+                    total-escrows-as-freelancer: (+ (get total-escrows-as-freelancer current-rep) u1),
+                    completed-escrows-as-freelancer: (if completed
+                        (+ (get completed-escrows-as-freelancer current-rep) u1)
+                        (get completed-escrows-as-freelancer current-rep)
+                    ),
+                    last-updated: stacks-block-height,
+                })
+            )
         )
     )
 )
