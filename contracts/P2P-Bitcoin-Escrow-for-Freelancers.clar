@@ -116,7 +116,7 @@
         reputation-score: u0,
         last-updated: u0,
     }
-    (map-get? user-reputation { user: user })
+        (map-get? user-reputation { user: user })
     )
 )
 
@@ -522,8 +522,7 @@
             (or (is-eq (get client escrow) rated-user) (is-eq (get freelancer escrow) rated-user))
             ERR-NOT-AUTHORIZED
         )
-        (asserts!
-            (is-none (get-user-rating tx-sender rated-user escrow-id))
+        (asserts! (is-none (get-user-rating tx-sender rated-user escrow-id))
             ERR-RATING-ALREADY-EXISTS
         )
         ;; Store the rating
@@ -542,13 +541,18 @@
     )
 )
 
-(define-private (update-user-reputation (user principal) (new-rating uint))
+(define-private (update-user-reputation
+        (user principal)
+        (new-rating uint)
+    )
     (let ((current-rep (get-user-reputation user)))
         (let (
                 (new-total-points (+ (get total-rating-points current-rep) new-rating))
                 (new-total-ratings (+ (get total-ratings-received current-rep) u1))
                 (completion-rate (get-user-completion-rate user))
-                (new-score (calculate-reputation-score new-total-points new-total-ratings completion-rate))
+                (new-score (calculate-reputation-score new-total-points new-total-ratings
+                    completion-rate
+                ))
             )
             (map-set user-reputation { user: user }
                 (merge current-rep {
@@ -562,7 +566,11 @@
     )
 )
 
-(define-private (increment-escrow-counter (user principal) (as-client bool) (completed bool))
+(define-private (increment-escrow-counter
+        (user principal)
+        (as-client bool)
+        (completed bool)
+    )
     (let ((current-rep (get-user-reputation user)))
         (if as-client
             (map-set user-reputation { user: user }
@@ -585,6 +593,27 @@
                     last-updated: stacks-block-height,
                 })
             )
+        )
+    )
+)
+
+(define-public (top-up-escrow
+        (escrow-id uint)
+        (additional uint)
+    )
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-NO-ACTIVE-ESCROW)))
+        (asserts! (is-eq (get client escrow) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active escrow) ERR-NO-ACTIVE-ESCROW)
+        (asserts! (< stacks-block-height (get deadline escrow))
+            ERR-DEADLINE-PASSED
+        )
+        (asserts! (> additional u0) ERR-INVALID-AMOUNT)
+        (try! (stx-transfer? additional tx-sender (as-contract tx-sender)))
+        (let ((new-amount (+ (get amount escrow) additional)))
+            (map-set escrows { escrow-id: escrow-id }
+                (merge escrow { amount: new-amount })
+            )
+            (ok new-amount)
         )
     )
 )
